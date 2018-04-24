@@ -5,7 +5,7 @@ class colors:
     HEADER = '\033[95m'
     OKBLUE = '\033[94m'
     OKGREEN = '\033[92m'
-    WARNING = '\033[93m'
+    WARNING = '\033[33m'
     FAIL = '\033[91m'
     ENDC = '\033[0m'
     BOLD = '\033[1m'
@@ -19,6 +19,11 @@ def debug(msg):
 
 def info(msg):
     print(colors.OKGREEN + "--- " + msg + colors.ENDC)
+    sys.stdout.flush()
+
+
+def warning(msg):
+    print(colors.WARNING + "!! " + msg + colors.ENDC)
     sys.stdout.flush()
 
 
@@ -158,7 +163,11 @@ def _expect(expected_type, actual, origin_file):
 
 
 def _load_spec_file(path):
-    result = yaml.safe_load(file(path, "r").read()) or {}
+    try:
+        result = yaml.safe_load(file(path, "r").read()) or {}
+    except IOError:
+        result = {}
+
     _expect(dict, result, path)
     return result
 
@@ -173,7 +182,7 @@ def _abs_to_cwd_rel(abspath):
 
 class Service:
     @classmethod
-    def load(cls, svc_yml, name):
+    def load(cls, name, svc_yml):
         spec = _load_spec_file(svc_yml)
         return Service(name,
                        os.path.dirname(svc_yml),
@@ -313,6 +322,80 @@ class ServiceSet:
 
 
 ##############################################
+# Cache
+##############################################
+
+ADS_ROOT = "adsroot"
+
+class Cache:
+    @classmethod
+    def get_cache_path(cls, dir_):
+        adscache = ".ads_cache.yml"
+        cache_home = os.getenv("ADS_CACHE_HOME")
+        if cache_home:
+            return "%s/%s" % (cache_home, adscache)
+
+        return "%s/%s" % (dir_, adscache)
+
+    @classmethod
+    def load_from_cache(cls, cachefile, project_file, profile_dir):
+        map_ = {}
+        if os.path.isfile(cachefile):
+            cache_spec = _load_spec_file(cachefile)
+
+            if cache_spec.get(ADS_ROOT) == project_file:
+                del cache_spec[ADS_ROOT]
+                map_ = cache_spec
+
+        return map_
+
+    def __init__(self, project_file, profile_dir):
+        self.cachefile = Cache.get_cache_path(profile_dir)
+        self.cache_map = Cache.load_from_cache(self.cachefile, project_file, profile_dir)
+
+    def get(self, key):
+        if isinstance(key, Service):
+            return self.cache_map.get(str(key))
+
+        return self.cache_map.get(key)
+
+    def valid_groups(self, service_sets):
+        selectors = set()
+        for service_set in service_sets:
+            for selector in service_set.selectors:
+                selectors.add(selector)
+
+        groups = set(group.name for group in service_sets)
+        services = selectors.difference(groups)
+
+        return self.yamls_exist(list(services))
+
+    def yamls_exist(self, services):
+        not_cached = []
+        for service in services:
+            yaml = self.get(service)
+
+            if not yaml or not os.path.isfile(yaml):
+                not_cached.append(service)
+
+        if not_cached:
+            warning("The following service(s) are not cached: "
+                    + "%s. This could be due to addition/removal of a service. " % (not_cached)
+                    + "If removed, deletion from adsroot.yml is required.")
+            return False
+
+        return True
+
+    def write_to_cache(self, project_file, svc_to_yml):
+        self.cache_map = dict(svc_to_yml)
+        svc_to_yml[ADS_ROOT] = project_file
+        with open(self.cachefile, 'w') as outfile:
+            yaml.safe_dump(svc_to_yml, outfile, default_flow_style=False)
+
+        del svc_to_yml[ADS_ROOT]
+
+
+##############################################
 # Project
 ##############################################
 
@@ -345,49 +428,61 @@ def _find_service_ymls(project_root):
         return False
 
     # BEWARE: O(n*m) algorithm!
-    return [
+    service_yamls = [
         os.path.join(project_root, p)
         for p in find_output
         if os.path.basename(p) == "ads.yml" and not in_nested_project_dir(p)
     ]
 
+    return _services_to_adsfiles(service_yamls)
 
-def _adsfiles_to_service_names(adsfiles):
+
+def _services_to_adsfiles(adsfiles):
     svc_name_to_file = {}
-    file_to_svc_name = {}
     for f in adsfiles:
         basename = os.path.basename(os.path.dirname(f))
         if basename in svc_name_to_file:
-            raise Exception("not yet implemented")
-        svc_name_to_file[basename] = f
-        file_to_svc_name[f] = basename
-    return file_to_svc_name
+            warning("Duplicate service: %s! Using %s." %
+                    (basename, svc_name_to_file[basename]))
+        else:
+            svc_name_to_file[basename] = f
+
+    return svc_name_to_file
 
 
 class Project:
     @classmethod
-    def load_from_dir(cls, root_dir):
+    def load_from_dir(cls, root_dir, profile_dir, check_cache):
         project_yml = _find_project_yml(os.path.abspath(root_dir))
         if not project_yml:
             return None
 
-        service_ymls = _find_service_ymls(os.path.dirname(project_yml))
-        return Project.load_from_files(project_yml, service_ymls)
+        return Project.load_from_files(project_yml, profile_dir, check_cache)
 
     @classmethod
-    def load_from_files(cls, project_yml, svc_ymls):
+    def load_from_files(cls, project_yml, profile_dir, check_cache):
         spec = _load_spec_file(project_yml)
         home = os.path.dirname(project_yml)
         name = spec.get("name") or os.path.basename(home)
-        services = [
-            Service.load(svc_file, svc_name)
-            for (svc_file, svc_name)
-            in _adsfiles_to_service_names(svc_ymls).items()
-        ]
+
         service_sets = ServiceSet.load_multiple(
             spec.get("groups"), project_yml)
         default_selector = ServiceSet.load_default(
             spec.get("default"), project_yml) or "all"
+
+        cache = Cache(project_yml, profile_dir)
+        if check_cache and cache.cache_map and cache.valid_groups(service_sets):
+            ymls_by_service = cache.cache_map
+        else:
+            ymls_by_service = _find_service_ymls(os.path.dirname(project_yml))
+            cache.write_to_cache(project_yml, ymls_by_service)
+
+        services = [
+            Service.load(svc_name, svc_file)
+            for (svc_name, svc_file)
+            in ymls_by_service.items()
+        ]
+
         return Project(name, home, services, service_sets, default_selector)
 
     def __init__(self,
@@ -428,8 +523,8 @@ class Profile:
 
 class Ads:
     @staticmethod
-    def load_from_fs(root_dir, profile_dir):
-        project = Project.load_from_dir(root_dir)
+    def load_from_fs(root_dir, profile_dir, check_cache):
+        project = Project.load_from_dir(root_dir, profile_dir, check_cache)
         if not project:
             return None
 
@@ -437,11 +532,23 @@ class Ads:
         return Ads(project, profile)
 
     @staticmethod
-    def load_from_env():
+    def load_from_env(use_cache):
         profile_home = os.getenv("ADS_PROFILE_HOME")
         if not profile_home or len(profile_home) == 0:
             profile_home = os.path.expanduser("~")
-        return Ads.load_from_fs(os.curdir, profile_home)
+
+        if use_cache == ALWAYS:
+            check_cache = True
+        elif use_cache == NEVER:
+            check_cache = False
+        elif use_cache == WITH_PROFILE:
+            check_cache = os.path.isfile(
+                          os.path.join(profile_home,
+                          ".ads_profile.yml"))
+        else:
+            check_cache = False
+
+        return Ads.load_from_fs(os.curdir, profile_home, check_cache)
 
     def __init__(self, project, profile=Profile()):
         self.project = project
@@ -509,6 +616,10 @@ class MyArgParser(argparse.ArgumentParser):
 # AdsCommand
 ##############################################
 
+ALWAYS = "always"
+WITH_PROFILE = "with profile"
+NEVER = "never"
+
 class AdsCommandException(Exception):
     def __init__(self, exit_code, msg=None):
         self.exit_code = exit_code
@@ -545,8 +656,8 @@ class SomeDown(AdsCommandException):
         super(SomeDown, self).__init__(23)
 
 
-def _load_or_die():
-    ads = Ads.load_from_env()
+def _load_or_die(use_cache):
+    ads = Ads.load_from_env(use_cache)
     if not ads:
         raise UsageError(
             "ads must be run from within an ads project. "
@@ -732,7 +843,7 @@ def _collect_logs_nonempty(services, log_type):
 def list_func(args):
     parser = MyArgParser(prog=cmd_list.name, description=cmd_list.description)
     parser.parse_args(args)
-    ads = _load_or_die()
+    ads = _load_or_die(use_cache=NEVER)
     ads.list()
 
 
@@ -741,7 +852,9 @@ def up(args):
     _add_verbose_arg(parser)
     _add_services_arg(parser)
     parsed_args = parser.parse_args(args)
-    ads = _load_or_die()
+    ads = _load_or_die(use_cache=ALWAYS
+                       if len(parsed_args.service) > 0
+                       else WITH_PROFILE)
     services = _resolve_selectors(ads, parsed_args.service, True)
     if len(services) > 1:
         info("Starting " + str(services))
@@ -754,7 +867,9 @@ def down(args):
     _add_verbose_arg(parser)
     _add_services_arg(parser)
     parsed_args = parser.parse_args(args)
-    ads = _load_or_die()
+    ads = _load_or_die(use_cache=ALWAYS
+                       if len(parsed_args.service) > 0
+                       else WITH_PROFILE)
     services = _resolve_selectors(ads, parsed_args.service, True)
     if not all(map(lambda sp: _down(sp, parsed_args.verbose), services)):
         raise StopFailed("One or more services failed to stop")
@@ -766,7 +881,9 @@ def bounce(args):
     _add_verbose_arg(parser)
     _add_services_arg(parser)
     parsed_args = parser.parse_args(args)
-    ads = _load_or_die()
+    ads = _load_or_die(use_cache=ALWAYS
+                       if len(parsed_args.service) > 0
+                       else WITH_PROFILE)
     services = _resolve_selectors(ads, parsed_args.service, True)
     all_stopped = all(
         map(lambda sp: _down(sp, parsed_args.verbose), services))
@@ -784,7 +901,9 @@ def status(args):
     _add_verbose_arg(parser)
     _add_services_arg(parser)
     parsed_args = parser.parse_args(args)
-    ads = _load_or_die()
+    ads = _load_or_die(use_cache=ALWAYS
+                       if len(parsed_args.service) > 0
+                       else WITH_PROFILE)
     services = _resolve_selectors(ads, parsed_args.service, False)
     if not all(map(lambda sp: _status(sp, parsed_args.verbose), services)):
         raise SomeDown()
@@ -825,7 +944,9 @@ def logs(args):
         # Default
         log_type = "general"
 
-    ads = _load_or_die()
+    ads = _load_or_die(use_cache=ALWAYS
+                       if len(parsed_args.service) > 0
+                       else WITH_PROFILE)
     services = _resolve_selectors(ads, parsed_args.service, False)
     resolved_log_paths = _collect_logs_nonempty(services, log_type)
 
@@ -844,7 +965,9 @@ def home(args):
     parser = MyArgParser(prog=cmd_home.name, description=cmd_home.description)
     _add_services_arg(parser)
     parsed_args = parser.parse_args(args)
-    ads = _load_or_die()
+    ads = _load_or_die(use_cache=ALWAYS
+                       if len(parsed_args.service) > 0
+                       else WITH_PROFILE)
     services = _resolve_selectors(ads, parsed_args.service, True)
     print("\n".join(_collect_rel_homes(services)))
 
@@ -853,7 +976,9 @@ def edit(args):
     parser = MyArgParser(prog=cmd_edit.name, description=cmd_edit.description)
     _add_services_arg(parser)
     parsed_args = parser.parse_args(args)
-    ads = _load_or_die()
+    ads = _load_or_die(use_cache=ALWAYS
+                       if len(parsed_args.service) > 0
+                       else WITH_PROFILE)
     services = _resolve_selectors(ads, parsed_args.service, True)
     homes = _collect_rel_homes(services)
     ymls = [os.path.join(home, "ads.yml") for home in homes]

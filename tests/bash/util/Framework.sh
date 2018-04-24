@@ -20,6 +20,10 @@ copy_project_to_tmp_and_go() {
     if [[ "$(ls "$project_dir")" ]]; then
         cp -R "$project_dir"/* "$project_tmp"
     fi
+    project_cache="$project_tmp/../.ads_cache.yml"
+    if [ -f $project_cache ]; then
+        rm "$project_cache"
+    fi
     cd "$project_tmp"
 }
 
@@ -33,6 +37,12 @@ go_test_project() {
 set_ads_profile() {
     export ADS_PROFILE_HOME="$test_tmp"
     cat > "$test_tmp/.ads_profile.yml"
+}
+
+# Temporarily sets your ads cache to the value of stdin
+set_ads_cache() {
+    export ADS_CACHE_HOME="$test_tmp"
+    cat > "$test_tmp/.ads_cache.yml"
 }
 
 ###############################################################################
